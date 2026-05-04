@@ -178,8 +178,26 @@ async function copyStateDir(srcId, newId, newSummary, userNamed) {
             }
             await writeFile(wsPath, updated, "utf8");
         } catch (err) {
-            // Non-fatal — DB rows are still correct, only the picker label may be wrong
             return { copied: true, path: dstDir, workspaceRewriteError: err.message };
+        }
+    }
+    // Rewrite events.jsonl: the session.start event embeds the source's
+    // sessionId, and Copilot CLI compares it against the directory name when
+    // computing the displayed summary in /resume. A mismatch makes Copilot
+    // treat the session as "recovered" and regenerate the display name from
+    // the first user message instead of using workspace.yaml's summary.
+    // Rewriting every literal occurrence of the source UUID is the simplest
+    // safe transform — UUIDs are 36-char tokens with no false-positive risk.
+    const eventsPath = join(dstDir, "events.jsonl");
+    if (existsSync(eventsPath)) {
+        try {
+            const original = await readFile(eventsPath, "utf8");
+            const updated = original.split(srcId).join(newId);
+            if (updated !== original) {
+                await writeFile(eventsPath, updated, "utf8");
+            }
+        } catch (err) {
+            return { copied: true, path: dstDir, eventsRewriteError: err.message };
         }
     }
     const st = await stat(dstDir);
