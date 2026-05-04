@@ -8,7 +8,7 @@
 //   /fork [...] --name="My new name"   Override the new session summary
 
 import { DatabaseSync } from "node:sqlite";
-import { cp, mkdir, rm, stat } from "node:fs/promises";
+import { cp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -135,7 +135,7 @@ function cloneRows(db, srcId, newId) {
     return counts;
 }
 
-async function copyStateDir(srcId, newId) {
+async function copyStateDir(srcId, newId, newSummary, userNamed) {
     const srcDir = join(STATE_DIR, srcId);
     const dstDir = join(STATE_DIR, newId);
     if (!existsSync(srcDir)) {
@@ -149,6 +149,38 @@ async function copyStateDir(srcId, newId) {
         try {
             await rm(p, { force: true });
         } catch {}
+    }
+    // Rewrite workspace.yaml so the fork has its OWN identity. Copilot CLI's
+    // /resume picker reads name/summary from this file (not from the central
+    // session-store.db's `summary` column), and a wrong `id` here would cause
+    // sync collisions with the source session on remote-steered installs.
+    const wsPath = join(dstDir, "workspace.yaml");
+    if (existsSync(wsPath)) {
+        try {
+            const original = await readFile(wsPath, "utf8");
+            const nowIso = new Date().toISOString();
+            const replacements = [
+                [/^id:\s.*$/m, `id: ${newId}`],
+                [/^name:\s.*$/m, `name: ${newSummary}`],
+                [/^summary:\s.*$/m, `summary: ${newSummary}`],
+                [/^user_named:\s.*$/m, `user_named: ${userNamed ? "true" : "false"}`],
+                [/^created_at:\s.*$/m, `created_at: ${nowIso}`],
+                [/^updated_at:\s.*$/m, `updated_at: ${nowIso}`],
+                // Wipe remote-control / multiplayer ids so the fork doesn't try
+                // to attach to the source's remote session.
+                [/^mc_task_id:\s.*$/m, `mc_task_id: ""`],
+                [/^mc_session_id:\s.*$/m, `mc_session_id: ""`],
+                [/^mc_last_event_id:\s.*$/m, `mc_last_event_id: ""`],
+            ];
+            let updated = original;
+            for (const [re, repl] of replacements) {
+                if (re.test(updated)) updated = updated.replace(re, repl);
+            }
+            await writeFile(wsPath, updated, "utf8");
+        } catch (err) {
+            // Non-fatal — DB rows are still correct, only the picker label may be wrong
+            return { copied: true, path: dstDir, workspaceRewriteError: err.message };
+        }
     }
     const st = await stat(dstDir);
     return { copied: true, path: dstDir, sizeBytes: st.size };
@@ -181,7 +213,7 @@ async function performFork(db, source, newName) {
         throw err;
     }
 
-    const stateResult = await copyStateDir(source.id, newId);
+    const stateResult = await copyStateDir(source.id, newId, finalSummary, Boolean(newName?.trim()));
     return { newId, finalSummary, counts, stateResult };
 }
 
