@@ -25,13 +25,17 @@ Copilot CLI ships with `/resume` (switch sessions) but no native fork. If you wa
 
 ## How it works
 
-A fork is a true snapshot:
-- Clones the row in `sessions` + all related rows in `turns`, `checkpoints`, `session_files`, `session_refs`, and the `search_index` FTS5 table from `~/.copilot/session-store.db`.
-- Recursively copies the per-session directory `~/.copilot/session-state/<src-uuid>/` (which holds `events.jsonl`, `checkpoints/`, `files/`, `research/`, `rewind-snapshots/`, `session.db`, `workspace.yaml`) under a freshly generated UUID.
-- Generates a new UUID via `crypto.randomUUID()`.
-- Wraps DB writes in `BEGIN IMMEDIATE` with a `busy_timeout=5000` ms so it plays nicely with the live Copilot CLI process holding the same WAL DB open.
+A fork is a true snapshot. To produce a fork that `/resume` displays correctly and that doesn't collide with the source, the extension needs to do more than just copy bytes — five distinct things must be patched per fork:
 
-The fork's default summary is `Forked: <original summary>`. Override with `--name="..."`. To rename later, `/resume` into the fork and use Copilot CLI's built-in `/rename`.
+1. **DB rows** (in `~/.copilot/session-store.db`): clones the row in `sessions` plus all related rows in `turns`, `checkpoints`, `session_files`, `session_refs`, and the `search_index` FTS5 table, all under a freshly generated UUID.
+2. **State dir** (`~/.copilot/session-state/<src>/`): recursively copied to `<new-uuid>/` (events.jsonl, checkpoints/, files/, research/, rewind-snapshots/, session.db, workspace.yaml).
+3. **`workspace.yaml` rewrite**: the fork gets its own `id`, `name`, `summary`, fresh timestamps, `user_named` flag, and **all `mc_*` remote-control fields are blanked** so the fork doesn't try to re-attach to the source's cloud session.
+4. **YAML quoting of `name`/`summary`**: titles like `Forked: <src>` contain a colon, which would break unquoted YAML and cause `/resume` to fall back to deriving the display name from `events.jsonl`'s first user message — so the values are always written as double-quoted strings.
+5. **`events.jsonl` rewrite**: every literal occurrence of the source UUID (notably in `session.start.data.sessionId`) is replaced with the new UUID. Without this, Copilot CLI sees a directory whose name doesn't match the embedded session id and treats the session as "recovered".
+
+DB writes are wrapped in `BEGIN IMMEDIATE` with a `busy_timeout=5000` ms so the extension plays nicely with the live Copilot CLI process holding the same WAL DB open.
+
+The fork's default summary is `Forked: <original summary>`. Override at creation with `--name="..."`. To rename later, `/resume` into the fork and use Copilot CLI's built-in `/rename`.
 
 > **Note on the current session:** when you fork the active session, the snapshot captures everything **up to the previous turn** — the `/fork` invocation itself is not in the fork, since it hasn't been persisted yet. This is mentioned in the result message.
 
@@ -68,14 +72,22 @@ Project extensions shadow user extensions on name collision.
 | Path | What |
 |---|---|
 | `~/.copilot/session-store.db` | INSERT into `sessions`, `turns`, `checkpoints`, `session_files`, `session_refs`, `search_index` (no DELETE, no UPDATE on existing rows) |
-| `~/.copilot/session-state/<new-uuid>/` | Created by recursive copy from the source state dir |
+| `~/.copilot/session-state/<new-uuid>/` | Created by recursive copy from the source state dir, then `workspace.yaml` and `events.jsonl` are patched in place to carry the fork's own identity |
 
 The source session is **never modified** — fork is a pure copy.
 
+## Gotchas the extension already handles for you
+
+These are mostly notes for forks of this extension or future Copilot CLI versions, but they explain why the code is more than a `cp -r` + `INSERT INTO sessions`:
+
+- **The `/resume` picker reads `workspace.yaml`, not `sessions.summary`.** If the YAML can't be parsed, the picker silently falls back to deriving the display name from the first `user.message` in `events.jsonl`. A title with an unquoted colon (e.g. `name: Forked: Foo`) is enough to trigger this — so the extension always quotes `name` and `summary`.
+- **`session.start` events embed the session id.** When the embedded id doesn't match the directory name, Copilot CLI treats the session as "recovered" and ignores the configured display name. That's why every literal occurrence of the source UUID in `events.jsonl` is rewritten to the new UUID.
+- **`mc_task_id` / `mc_session_id` / `mc_last_event_id`** in `workspace.yaml` link a session to a remote multiplayer/coding-agent task. If they're left as the source's values in the fork, the fork tries to attach to the source's remote session on resume. The extension blanks them.
+- **`vscode.metadata.json`** is intentionally not copied — Copilot CLI regenerates it with a fresh timestamp on first resume, and inheriting the source's value would make the IDE think the fork is the same window.
+
 ## Caveats
 
-- The `session-store.db` schema is internal to Copilot CLI and not officially documented. **It may change in future Copilot versions** and break this extension. Tested against Copilot CLI **v1.0.40**.
-- `vscode.metadata.json` inside the fork's state dir is regenerated by Copilot CLI itself with a fresh timestamp — this is harmless (the file only contains neutral timestamps).
+- The `session-store.db` schema and `workspace.yaml` shape are internal to Copilot CLI and not officially documented. **They may change in future Copilot versions** and break this extension. Tested against Copilot CLI **v1.0.40**.
 - You cannot fork **into** the current process — the fork is created on disk and resumable by launching `copilot --resume="<uuid>"` in another terminal (or after `/exit`).
 - If you fork while a turn is in flight, SQLite's busy timeout will block the fork up to 5 s waiting for the writer; if the timeout fires the fork is cleanly aborted (no partial state).
 
@@ -96,4 +108,8 @@ MIT — see [LICENSE](LICENSE).
 
 ## Contributing
 
-Issues and PRs welcome. Especially: support for multi-version DB schemas, a `--turn-limit=N` flag to fork only the first N turns (branch before a bad turn), or a `/sessions` listing helper.
+Issues and PRs welcome. Open ideas:
+- Use a real YAML serializer (parse → mutate → re-emit) so `workspace.yaml` rewrites are robust to other special characters and future schema fields.
+- Support for multi-version DB schemas (detect `schema_version` and refuse on incompatible).
+- A `--turn-limit=N` flag to fork only the first N turns (branch before a bad turn).
+- A `/sessions` listing helper that filters and prints the catalog as text instead of going through the TUI picker.
