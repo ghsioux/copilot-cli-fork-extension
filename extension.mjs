@@ -159,10 +159,18 @@ async function copyStateDir(srcId, newId, newSummary, userNamed) {
         try {
             const original = await readFile(wsPath, "utf8");
             const nowIso = new Date().toISOString();
+            // Always quote name/summary because they may contain ":" (e.g. our
+            // default "Forked: <src>" prefix) which is otherwise interpreted
+            // by YAML 1.1 as a nested mapping and breaks the whole file. A
+            // broken workspace.yaml causes Copilot CLI's /resume picker to
+            // fall back to deriving the display name from events.jsonl's
+            // first user message — exactly the bug this branch fixes.
+            const yamlString = (s) =>
+                `"${String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
             const replacements = [
                 [/^id:\s.*$/m, `id: ${newId}`],
-                [/^name:\s.*$/m, `name: ${newSummary}`],
-                [/^summary:\s.*$/m, `summary: ${newSummary}`],
+                [/^name:\s.*$/m, `name: ${yamlString(newSummary)}`],
+                [/^summary:\s.*$/m, `summary: ${yamlString(newSummary)}`],
                 [/^user_named:\s.*$/m, `user_named: ${userNamed ? "true" : "false"}`],
                 [/^created_at:\s.*$/m, `created_at: ${nowIso}`],
                 [/^updated_at:\s.*$/m, `updated_at: ${nowIso}`],
